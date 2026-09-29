@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Firecrawl full-stack startup script
-# Usage: ./start.sh          — start everything
-#        ./start.sh stop      — stop the API (backing services keep running)
-#        ./start.sh status    — show status of every component
-#        ./start.sh restart   — stop API then start everything fresh
+# Usage: ./start.sh            — build (if needed) + start everything
+#        ./start.sh build       — build the API (native module + TypeScript)
+#        ./start.sh stop        — stop the Firecrawl processes (backing services keep running)
+#        ./start.sh status      — show status of every component
+#        ./start.sh restart     — stop then start everything fresh
+#        ./start.sh test        — run smoke tests against a running API
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_DIR="$SCRIPT_DIR/apps/api"
+NATIVE_DIR="$API_DIR/native"
 LOG_DIR="/tmp/firecrawl-logs"
 PID_FILE="/tmp/firecrawl-api.pid"
 
@@ -20,6 +23,36 @@ warn() { echo -e "  ${YELLOW}!${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; }
 info() { echo -e "  ${BLUE}ℹ${NC} $1"; }
 
+# ── Build ─────────────────────────────────────────────────────────────────────
+build_api() {
+  info "Installing API dependencies..."
+  (cd "$API_DIR" && pnpm install --frozen-lockfile --ignore-scripts) \
+    || { fail "pnpm install failed"; exit 1; }
+
+  info "Building native module (Rust — a few minutes on first run)..."
+  (cd "$NATIVE_DIR" && pnpm build) \
+    || { fail "Native module build failed"; exit 1; }
+  ok "Native module built"
+
+  info "Building API (tsc)..."
+  (cd "$API_DIR" && pnpm build) \
+    || { fail "API build failed"; exit 1; }
+  ok "API built"
+}
+
+build_if_needed() {
+  local need_build=0
+  [ -f "$API_DIR/dist/src/harness.js" ] || need_build=1
+  compgen -G "$NATIVE_DIR"/*.node >/dev/null 2>&1 || need_build=1
+
+  if [ "$need_build" -eq 1 ]; then
+    warn "Build artifacts missing — building now (first run only, a few minutes)"
+    build_api
+  else
+    ok "Build artifacts present"
+  fi
+}
+
 # ── Redis ─────────────────────────────────────────────────────────────────────
 start_redis() {
   if redis-cli ping >/dev/null 2>&1; then
@@ -29,7 +62,12 @@ start_redis() {
   info "Starting Redis..."
   nohup redis-server --daemonize yes --logfile "$LOG_DIR/redis.log" >/dev/null 2>&1
   sleep 1
-  redis-cli ping >/dev/null 2>&1 && ok "Redis started" || fail "Redis failed to start — check $LOG_DIR/redis.log"
+  if redis-cli ping >/dev/null 2>&1; then
+    ok "Redis started"
+  else
+    fail "Redis failed to start — check $LOG_DIR/redis.log"
+    exit 1
+  fi
 }
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
@@ -39,10 +77,16 @@ start_postgres() {
     return
   fi
   info "Starting PostgreSQL..."
-  sudo pg_ctlcluster 16 main start >/dev/null 2>&1 || true
+  local cluster_version
+  cluster_version="$(pg_lsclusters -h 2>/dev/null | awk '{print $1}' | head -1)"
+  if [ -z "$cluster_version" ]; then
+    fail "No PostgreSQL cluster found via pg_lsclusters — install/init one first"
+    exit 1
+  fi
+  sudo pg_ctlcluster "$cluster_version" main start >/dev/null 2>&1 || true
   sleep 2
   if pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
-    ok "PostgreSQL started"
+    ok "PostgreSQL started (cluster $cluster_version)"
   else
     fail "PostgreSQL failed — check pg logs"
     exit 1
@@ -71,20 +115,25 @@ stop_api() {
   if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
-      info "Stopping Firecrawl API (PID $PID)..."
-      kill "$PID" 2>/dev/null || true
-      sleep 2
+      info "Stopping Firecrawl harness (PID $PID)..."
+      kill "$PID" 2>/dev/null || true   # SIGTERM — harness shuts its children down gracefully
+      for i in $(seq 1 10); do
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 1
+      done
       kill -9 "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
   fi
-  pkill -9 -f "dist/src/(harness|index|services)" 2>/dev/null || true
-  fuser -k 3002/tcp 3004/tcp 3005/tcp 3011/tcp 2>/dev/null || true
+  # Fallback for stragglers — scoped to THIS checkout's dist path, never to
+  # whatever else happens to be listening on our ports.
+  pkill -9 -f "$API_DIR/dist/src/(harness|index|services)" 2>/dev/null || true
   sleep 1
 }
 
 start_api() {
   stop_api  # clean slate
+  build_if_needed
 
   info "Starting Firecrawl API..."
   cd "$API_DIR"
@@ -94,18 +143,18 @@ start_api() {
   disown $API_PID
   echo $API_PID > "$PID_FILE"
 
-  info "Waiting for API on :3002 (up to 60s)..."
-  for i in $(seq 1 60); do
+  local wait_secs=60
+  info "Waiting for API on :3002 (up to ${wait_secs}s)..."
+  for i in $(seq 1 "$wait_secs"); do
     nc -z localhost 3002 2>/dev/null && ok "Firecrawl API ready (PID $API_PID)" && return
     sleep 1
-    # Check if process died early
     if ! kill -0 $API_PID 2>/dev/null; then
       fail "API process died — last lines of log:"
       tail -20 "$LOG_DIR/api.log"
       return 1
     fi
   done
-  fail "API did not come up within 30s — check $LOG_DIR/api.log"
+  fail "API did not come up within ${wait_secs}s — check $LOG_DIR/api.log"
   return 1
 }
 
@@ -113,16 +162,21 @@ start_api() {
 show_status() {
   echo ""
   echo -e "${BLUE}══ Firecrawl Status ══${NC}"
-  pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1   && ok "PostgreSQL   :5432" || fail "PostgreSQL   :5432"
-  redis-cli ping >/dev/null 2>&1                      && ok "Redis        :6379" || fail "Redis        :6379"
-  nc -z localhost 5672 2>/dev/null                    && ok "RabbitMQ     :5672" || fail "RabbitMQ     :5672"
-  nc -z localhost 3002 2>/dev/null                    && ok "API          :3002" || fail "API          :3002"
-  nc -z localhost 3004 2>/dev/null                    && ok "Extract wkr  :3004" || fail "Extract wkr  :3004"
-  nc -z localhost 3005 2>/dev/null                    && ok "Queue wkr    :3005" || fail "Queue wkr    :3005"
-  nc -z localhost 3011 2>/dev/null                    && ok "NuQ prefetch :3011" || fail "NuQ prefetch :3011"
+  pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1 && ok "PostgreSQL      :5432" || fail "PostgreSQL      :5432"
+  redis-cli ping >/dev/null 2>&1                    && ok "Redis           :6379" || fail "Redis           :6379"
+  nc -z localhost 5672 2>/dev/null                  && ok "RabbitMQ        :5672" || fail "RabbitMQ        :5672"
+  nc -z localhost 3002 2>/dev/null                  && ok "API             :3002" || fail "API             :3002"
+  nc -z localhost 3004 2>/dev/null                  && ok "Extract worker  :3004" || fail "Extract worker  :3004"
+  nc -z localhost 3005 2>/dev/null                  && ok "Queue worker    :3005" || fail "Queue worker    :3005"
+  for i in 0 1 2 3 4; do
+    port=$((3006 + i))
+    nc -z localhost "$port" 2>/dev/null && ok "NuQ worker-$i    :$port" || fail "NuQ worker-$i    :$port"
+  done
+  nc -z localhost 3011 2>/dev/null                  && ok "NuQ prefetch    :3011" || fail "NuQ prefetch    :3011"
+  nc -z localhost 3012 2>/dev/null                  && ok "NuQ reconciler  :3012" || fail "NuQ reconciler  :3012"
 
   echo ""
-  WCOUNT=$(ps aux | grep -cE "dist/src/(services|index)" || true)
+  WCOUNT=$(ps aux | grep -cE "[d]ist/src/(services|index)" || true)
   info "Worker processes: $WCOUNT"
   if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
@@ -134,7 +188,8 @@ show_status() {
 # ── Quick smoke test ──────────────────────────────────────────────────────────
 smoke_test() {
   echo -e "${BLUE}══ Smoke Tests ══${NC}"
-  API_KEY="fc-b6592fd7bdef4e238c843d11a91c66b7"
+  local API_KEY="${TEST_API_KEY:-$(grep '^TEST_API_KEY=' "$API_DIR/.env.local" 2>/dev/null | cut -d= -f2-)}"
+  local failures=0
 
   run_test() {
     local name="$1" payload="$2" endpoint="$3"
@@ -147,6 +202,7 @@ smoke_test() {
     else
       fail "$name"
       echo "    Response: $(echo "$RESULT" | head -c 200)"
+      failures=$((failures + 1))
     fi
   }
 
@@ -155,12 +211,16 @@ smoke_test() {
   run_test "Map"                         '{"url":"https://example.com"}' /v1/map
   run_test "Map (hermes integration)"    '{"url":"https://example.com","integration":"hermes"}' /v1/map
   echo ""
+  [ "$failures" -eq 0 ]
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 CMD="${1:-start}"
 
 case "$CMD" in
+  build)
+    build_api
+    ;;
   start)
     echo -e "${BLUE}══ Starting Firecrawl ══${NC}"
     start_redis
@@ -191,7 +251,7 @@ case "$CMD" in
     smoke_test
     ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status|test}"
+    echo "Usage: $0 {build|start|stop|restart|status|test}"
     exit 1
     ;;
 esac
